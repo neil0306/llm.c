@@ -46,7 +46,8 @@ endif
 ifneq ($(CI),true) # if not in CI, then use the GPU query
   ifndef GPU_COMPUTE_CAPABILITY # set to defaults if: make GPU_COMPUTE_CAPABILITY=
     ifneq ($(call file_exists_in_path, __nvcc_device_query),)
-      GPU_COMPUTE_CAPABILITY = $(shell __nvcc_device_query)
+      # GPU_COMPUTE_CAPABILITY = $(shell __nvcc_device_query)
+      GPU_COMPUTE_CAPABILITY = 86   # 由于服务器上有2080Ti和3090, 这里需要限制只使用3090架构进行编译, 否则会编译失败.
       GPU_COMPUTE_CAPABILITY := $(strip $(GPU_COMPUTE_CAPABILITY))
     endif
   endif
