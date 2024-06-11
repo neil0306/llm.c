@@ -118,6 +118,20 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)  # final module head, ie. the language model head (for down-stream task)
 
+        # 注意: 在Attention is all you need 以及 GPT-2 源码(tensorflow版本)中, 模型最开始的 token embedding 和 最后输出阶段生成 logits 的时候, 使用的权重矩阵都是相同的, 文章中称为 weight sharing
+        # 在上面的实现中, 我们其实还没有进行 weight sharing 的操作, 故需要进行如下改动
+        self.transformer.wte.weight = self.lm_head.weight
+        
+        # 用指定的方式初始化参数
+        self.apply(self._init_weights)   # apply() 方法是从 nn.Module 中集成过来的, 它负责初始化所有的子模块
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):  # 初始化模型中所有 linear 层
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.2)  # 均值为0.0 和 std为0.2 是从 OpenAI 源码中抄来的, 为什么这么用原因未知
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.2)   # 同上
 
     def forward(self, idx, targets=None):
         # idx is of shape (B, T), T is short for "Time" 
@@ -224,7 +238,7 @@ class DataLoaderLite:
 
     def next_batch(self):
         B, T = self.B, self.T
-        buf = self.tokens[self.current_position : self.current_position + 1]
+        buf = self.tokens[self.current_position : self.current_position + B*T + 1]
         x = (buf[:-1]).view(B,T) # input
         y = (buf[1:]).view(B,T)  # ground truth
         
@@ -343,15 +357,25 @@ model.to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)   # adamw 可以当做是 adam 优化器修了一个bug;  
                                                              # 3e-4 是大家常用的 early age debug Learning Rate
 
-# debug stage: 用小批量数据(一直不加新数据进来), 反复更新梯度, 看看模型是否能过拟合, 如果会过拟合, 证明模型在正常训练
+# # debug stage: 用小批量数据(一直不加新数据进来), 反复更新梯度, 看看模型是否能过拟合, 如果会过拟合, 证明模型在正常训练
+# for i in range(50):
+#     optimizer.zero_grad()     # 一定以及 清空历史 梯度!!!
+#     logits, loss = model(x, y)
+#     loss.backward()    # 计算梯度
+#     optimizer.step()   # 更新参数
+#     print(f"step {i}, loss: {loss.item()}")   # loss.item() 可以将tensor换成为 float, 并把数据放回CPU
+
+
+# train model
+train_loader = DataLoaderLite(B=4, T=32)
+
 for i in range(50):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()     # 一定以及 清空历史 梯度!!!
     logits, loss = model(x, y)
     loss.backward()    # 计算梯度
     optimizer.step()   # 更新参数
     print(f"step {i}, loss: {loss.item()}")   # loss.item() 可以将tensor换成为 float, 并把数据放回CPU
-
-
-
 
 import sys; sys.exit(0)   # 代码走到这里就会停止, 这是一个debug的时候比较不错的方式
