@@ -127,11 +127,14 @@ class GPT(nn.Module):
     
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):  # 初始化模型中所有 linear 层
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.2)  # 均值为0.0 和 std为0.2 是从 OpenAI 源码中抄来的, 为什么这么用原因未知
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)  # 均值为0.0 和 std为0.2 是从 OpenAI 源码中抄来的, 为什么这么用原因未知
+                                                                        # 如果按照Xavier初始化方法, 方差 = 1/本层输入元素个数, 故标准差 std = 1/sqrt(n)
+                                                                        # 本层输入元素个数其实就是模型的 d_model, 对于124M模型, d_model = 768, std应为 0.036; 如果是1600, std 就差不多是 0.025
+                                                                        # 故, 猜测这是根据 Xavier 初始化得到的数值
             if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
+                torch.nn.init.zeros_(module.bias)                     # pytorch 里, bias的默认初始化并不是0, 而是按照均匀分布进行初始化
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.2)   # 同上
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)   # 同上
 
     def forward(self, idx, targets=None):
         # idx is of shape (B, T), T is short for "Time" 
