@@ -15,7 +15,7 @@ class CausalSelfAttention(nn.Module):   # 因果(时序)attention: 掩盖掉 t �
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)  # 3: query, key, value
         # output
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
+        self.c_proj.NANOGPT_SCALE_INIT = 1      # 由于走到这部分之后就到 residue connection 的加法, 为了确保数值的 std 仍然是在1附近, 这里需要一个scale down 的flag
         
         # regularization
         self.n_head = config.n_head
@@ -65,7 +65,9 @@ class MLP(nn.Module):
         self.c_fc   = nn.Linear(config.n_embd, 4 * config.n_embd)   # fully connected, 升维, 隐空间空间维度为输入维度的4倍
         self.gelu   = nn.GELU(approximate="tanh")                   # 加非线性
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)   # fully connected, 降维, 回到原来维度
-    
+        self.c_proj.NANOGPT_SCALE_INIT = 1      # 由于走到这部分之后就到 residue connection 的加法, 为了确保数值的 std 仍然是在1附近, 
+                                                # 这加一个 scale down 的flag, 方便在GPT类里初始化权重的时候做特殊处理
+
     def forward(self, x):
         x = self.c_fc(x)
         x = self.gelu(x)
@@ -120,21 +122,26 @@ class GPT(nn.Module):
 
         # 注意: 在Attention is all you need 以及 GPT-2 源码(tensorflow版本)中, 模型最开始的 token embedding 和 最后输出阶段生成 logits 的时候, 使用的权重矩阵都是相同的, 文章中称为 weight sharing
         # 在上面的实现中, 我们其实还没有进行 weight sharing 的操作, 故需要进行如下改动
-        self.transformer.wte.weight = self.lm_head.weight
+        self.transformer.wte.weight = self.lm_head.weight   # 由于是共享权重, 所以在初始化阶段其实进行了2次初始化, 不过影响不大
         
         # 用指定的方式初始化参数
         self.apply(self._init_weights)   # apply() 方法是从 nn.Module 中集成过来的, 它负责初始化所有的子模块
     
     def _init_weights(self, module):
+        std = 0.02
         if isinstance(module, nn.Linear):  # 初始化模型中所有 linear 层
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)  # 均值为0.0 和 std为0.2 是从 OpenAI 源码中抄来的, 为什么这么用原因未知
+            if hasattr(module, "NANOGPT_SCALE_INIT"):          # 前面的子模块中增加了这个flag, 这里检查一下flag, 然后做针对性的初始化
+                std *= (2 * self.config.n_layer) ** -0.5            # 在GPT-2的paper中(介绍不同大小的模型的表格下面的段落)有提到, 为了确保residue stream的输出依旧保持方差为1, 需要对权重进行scale down
+                                                                    # 这里的倍数 2 是因为 Block 模块(self-attention) 的 forward path 里面, Attention 和 MLP 都有一次残差链接
+            
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)  # 均值为0.0 和 std为0.2 是从 OpenAI 源码中抄来的, 为什么这么用原因未知
                                                                         # 如果按照Xavier初始化方法, 方差 = 1/本层输入元素个数, 故标准差 std = 1/sqrt(n)
                                                                         # 本层输入元素个数其实就是模型的 d_model, 对于124M模型, d_model = 768, std应为 0.036; 如果是1600, std 就差不多是 0.025
                                                                         # 故, 猜测这是根据 Xavier 初始化得到的数值
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)                     # pytorch 里, bias的默认初始化并不是0, 而是按照均匀分布进行初始化
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)   # 同上
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)   # 同上
 
     def forward(self, idx, targets=None):
         # idx is of shape (B, T), T is short for "Time" 
@@ -333,6 +340,13 @@ else:
     device = "cpu"
 
 print(f"We are using {device} ...")
+
+# 固定随机种子, 便于复现结果
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+elif torch.backends.mps.is_available():
+    torch.mps.manual_seed(1337)
 
 # get a data batch 
 import tiktoken
