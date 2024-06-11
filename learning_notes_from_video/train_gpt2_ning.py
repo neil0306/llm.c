@@ -5,7 +5,7 @@ import torch.nn as nn
 from torch.nn import functional as F 
 
 
-# ----------------------------------------------
+# ----------------------------------- Define our GPT-2 model ------------------------------------
 
 class CausalSelfAttention(nn.Module):   # 因果(时序)attention: 掩盖掉 t 时刻后面的输入, 防止信息泄露
     def __init__(self, config):
@@ -21,14 +21,14 @@ class CausalSelfAttention(nn.Module):   # 因果(时序)attention: 掩盖掉 t �
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         # not really a "bias", more of a mask, but following the OpenAI/HuggingFace naming though
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size))
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size))  # 下三角阵, (1,1,1024,1024)
 
     def forward(self, x):
         B,T,C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch
-        qkv = self.c_attn(x)
-        q,k,v = qkv.split(self.n_embd, dim=2)
+        qkv = self.c_attn(x)   # (B,T, 3*n_embd), 严格来说, q,k,v 在生成的时候分别对应着 w_q, w_k, w_v 的, 这里只是将这三个矩阵叠起来了, 所以可以直接用一层比较大的 Linear 完成.
+        q,k,v = qkv.split(self.n_embd, dim=2) # (B,T, n_embd), (B,T, n_embd), (B,T, n_embd)
 
         # nh is "number of heads", hs, is "head size", and C (number of channels) = nh * hs
         # e.g. in GPT-2 (124M), n_head=12, hs=64, so nh*hs=C=768 channels in the Transformer
@@ -38,7 +38,7 @@ class CausalSelfAttention(nn.Module):   # 因果(时序)attention: 掩盖掉 t �
 
         # attention (materializes the large (T,T) matrix for all the queries and keys)
         att = (q @ k.transpose(-2, -1) * (1.0 / math.sqrt(k.size(-1))))   # attention 公式
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float("-inf"))   # masked, 防止信息泄露
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float("-inf"))   # masked, 只保留下三角阵的数值(按照时间顺序, q的每一行只比上一行多看到一个k的信息), 防止信息泄露
         att = F.softmax(att, dim=-1)
         y = att @ v    # (B,nh,T,T) x (B,nh,T,hs) => (B,nh,T,hs), weighted sum operation
 
@@ -119,13 +119,13 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)  # final module head, ie. the language model head (for down-stream task)
 
 
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         # idx is of shape (B, T), T is short for "Time" 
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
         
         # forward token
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape: (T)
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # 生成位置编号, shape: (T)
         pos_emb = self.transformer.wpe(pos)  # position embedding (T, n_embd),  实际上是 (1, T, n_embd)
         tok_emd = self.transformer.wte(idx)  # token embedding (B, T, n_embd)
         x = tok_emd + pos_emb                # 隐含一个broadcasting操作
@@ -136,9 +136,12 @@ class GPT(nn.Module):
         
         # forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
-        logit = self.lm_head(x)  # (B,T,vocab_size)
+        logits = self.lm_head(x)  # (B,T,vocab_size)
         
-        return logit
+        loss = None
+        if(targets is not None):
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))  # cross-entrpy只能接受2维向量, logits view 之后shape变成 (B*T, vocab_size), target 变成(b*T)
+        return logits, loss
 
     # -------------- 加载 OpenAI 的预训练权重 到上面手撸的 GPT-2 -----
     @classmethod
@@ -199,13 +202,112 @@ class GPT(nn.Module):
 
         return model
 
-# ----------------------------- test of our GPT-2 -----------------------------------------
-device = "cpu"
-# ning: 用2080Ti做实验, 指定一下GPU
-device = torch.device("cuda:2")   # 用2080Ti做实验
-print( f"we are using: {torch.cuda.get_device_name(2)}")
 
-# 或者自动检测GPU, CPU
+# ----------------------------- Define our DataLoader -------------------------------------------------------------------------------
+import tiktoken
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        with open("dev/data/tinyshakespeare/tiny_shakespeare.txt", 'r') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding("gpt2")
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+
+        print(f"Loaded {len(tokens)} tokens.")
+        print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
+        
+        # state
+        self.current_position = 0
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position + 1]
+        x = (buf[:-1]).view(B,T) # input
+        y = (buf[1:]).view(B,T)  # ground truth
+        
+        # advance the position in the tensor
+        self.current_position += B*T
+        # if loading the next batch would be out of bounds, reset
+        if self.current_position + (B*T+1) > len(self.tokens):
+            self.current_position = 0
+        return x,y
+
+# ----------------------------- test of our GPT-2 (with/without loading pre-trained weights) -----------------------------------------
+# device = "cpu"
+# # ning: 用2080Ti做实验, 指定一下GPU
+# # device = torch.device("cuda:2")   # 用2080Ti做实验
+# # print( f"we are using: {torch.cuda.get_device_name(2)}")
+
+# # 或者自动检测GPU, CPU
+# if torch.cuda.is_available():
+#     device = "cuda"
+# elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+#     device = "mps"    # macbook
+# else:
+#     device = "cpu"
+
+# # model = GPT.from_pretrained("gpt2")      # 加载 OpenAI 提供的预训练权重
+# # print("ohhhhhhhhhhhhhhh, pretrained weights load success!!!")   
+# model = GPT(GPTConfig)  # 不加载预训练参数, 直接用pytorch自带的随机初始化
+
+# num_return_sequences = 5
+# max_length = 30
+# model.to(device)
+# model.eval()
+
+# # ------------- Generate!! --------------------- 
+# # get prefix tokens from raw text
+# import tiktoken
+# enc = tiktoken.get_encoding("gpt2")
+# tokens = enc.encode("Hello, I am a language model,")
+# tokens = torch.tensor(tokens, dtype=torch.long) # (8)
+# tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)  # (8) -> (1,8) -> (5,8)
+# x = tokens.to(device)
+
+# # B = 5, T = 8;
+# #   B为batch, 因为这里想针对 "Hello, I am a language model," 这段话, 生成5个版本的后续输出
+# torch.manual_seed(42)         # CPU 的随机种子
+# torch.cuda.manual_seed(42)    # GPU 的随机种子
+# while x.size(1) < max_length:  # 每次预测出来的词加入到 pre-context 中, 当长度小于1024时才继续往下生成内容
+#     # get output logit
+#     with torch.no_grad():
+#         logits = model(x)   # (B, T, vocab_size)
+        
+#         # take the logits at the last position  (最后一个才是prediction)
+#         logits = logits[:,-1,:]  #  (B, vocab_size)
+        
+#         # get the probabilities
+#         probs = F.softmax(logits, dim = -1) # (B, vocab_size)
+        
+#         # probs 相当于单词表中下一个单词可能出现的概率, 下面我们取可能性最高的前50个词对应的index
+#             # topk 会只保留最大的前50个概率, 让后将其他元素置零, 这样就可以避免采样到 很不常见的单词  
+#         # do top-k sampling of 50 (huggingface pipeline default)
+#         # topk_probs here becomes (5,50), topk_indices is (5,50)
+#         topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+        
+#         # 把前50个候选词的概率作为数值, 丢到"多项式分布"公式中, 从而决定下一个词
+#             # 这样做的意义是: 将50个词的概率作为权重, 让模型在预测下一个词的时候具有更丰富的多样性, 而不是直接依赖模型给出的最可能的下一词
+#         # select a token from the top-k probabilities
+#         ix = torch.multinomial(topk_probs, 1)    # (B,1)
+        
+#         # 对B个版本的预测分别获取各自的下一个词在词表中的index
+#         # gather the corresponding indices
+#         xcol = torch.gather(topk_indices, -1, ix) # (B,1)
+        
+#         x = torch.cat((x, xcol), dim=1)
+        
+
+# # print the generated text
+# for i in range(num_return_sequences):
+#     tokens = x[i, :max_length].tolist()
+#     decode = enc.decode(tokens)
+#     print("->", decode)
+
+# ---------------------------------- train our GPT-2  ---------------------------------------------------
+device = "cpu"
 if torch.cuda.is_available():
     device = "cuda"
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -213,59 +315,43 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
 else:
     device = "cpu"
 
-model = GPT.from_pretrained("gpt2")
-# print("ohhhhhhhhhhhhhhh, pretrained weights load success!!!")   
+print(f"We are using {device} ...")
 
-num_return_sequences = 5
-max_length = 30
-model.to(device)
-model.eval()
-
-# get prefix tokens from raw text
+# get a data batch 
 import tiktoken
 enc = tiktoken.get_encoding("gpt2")
-tokens = enc.encode("Hello, I am a language model,")
-tokens = torch.tensor(tokens, dtype=torch.long) # (8)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)  # (8) -> (1,8) -> (5,8)
-x = tokens.to(device)
+with open("dev/data/tinyshakespeare/tiny_shakespeare.txt", 'r') as f:
+    text = f.read()
+text = text[:1000]
+tokens = enc.encode(text)  # 1000个单词进行预处理后剩下 285 个token
+B,T, = 4, 32
+buf = torch.tensor(tokens[:B*T + 1])
+buf = buf.to(device)          # 先把buffer丢到GPU, 后续的x,y就不用再次操作了
+x = buf[:-1].view(B,T)  # (B,T)
+y = buf[1:].view(B,T)   # (B,T)
 
-# Generate!! 
-# B = 5, T = 8;
-#   B为batch, 因为这里想针对 "Hello, I am a language model," 这段话, 生成5个版本的后续输出
-torch.manual_seed(42)         # CPU 的随机种子
-torch.cuda.manual_seed(42)    # GPU 的随机种子
-while x.size(1) < max_length:  # 每次预测出来的词加入到 pre-context 中, 当长度小于1024时才继续往下生成内容
-    # get output logit
-    with torch.no_grad():
-        logits = model(x)   # (B, T, vocab_size)
-        
-        # take the logits at the last position  (最后一个才是prediction)
-        logits = logits[:,-1,:]  #  (B, vocab_size)
-        
-        # get the probabilities
-        probs = F.softmax(logits, dim = -1) # (B, vocab_size)
-        
-        # probs 相当于单词表中下一个单词可能出现的概率, 下面我们取可能性最高的前50个词对应的index
-            # topk 会只保留最大的前50个概率, 让后将其他元素置零, 这样就可以避免采样到 很不常见的单词  
-        # do top-k sampling of 50 (huggingface pipeline default)
-        # topk_probs here becomes (5,50), topk_indices is (5,50)
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        
-        # 把前50个候选词的概率作为数值, 丢到"多项式分布"公式中, 从而决定下一个词
-            # 这样做的意义是: 将50个词的概率作为权重, 让模型在预测下一个词的时候具有更丰富的多样性, 而不是直接依赖模型给出的最可能的下一词
-        # select a token from the top-k probabilities
-        ix = torch.multinomial(topk_probs, 1)    # (B,1)
-        
-        # 对B个版本的预测分别获取各自的下一个词在词表中的index
-        # gather the corresponding indices
-        xcol = torch.gather(topk_indices, -1, ix) # (B,1)
-        
-        x = torch.cat((x, xcol), dim=1)
-        
+# get logits
+model = GPT(GPTConfig)
+model.to(device)
+# logits, loss = model(x, y)  # 输出的loss差不多是10.9930(或者11左右), 
+#                             # 注意现在还没有开始训练, 输出这个数值是因为 cross-entropy 本质上就是计算 -ln(probability),
+#                             # 由于我们词表大小是 20257, 如果初始化的模型等同于均匀分布, 那么我们预测的下一个词的概率就应该接近 1/20257, 此时得到 9.91625, 
+#                             # 因此这里输出 10.9930 是可以接受的初始化状态
+# print(loss)
 
-# print the generated text
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decode = enc.decode(tokens)
-    print("->", decode)
+# optimizer!!
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)   # adamw 可以当做是 adam 优化器修了一个bug;  
+                                                             # 3e-4 是大家常用的 early age debug Learning Rate
 
+# debug stage: 用小批量数据(一直不加新数据进来), 反复更新梯度, 看看模型是否能过拟合, 如果会过拟合, 证明模型在正常训练
+for i in range(50):
+    optimizer.zero_grad()     # 一定以及 清空历史 梯度!!!
+    logits, loss = model(x, y)
+    loss.backward()    # 计算梯度
+    optimizer.step()   # 更新参数
+    print(f"step {i}, loss: {loss.item()}")   # loss.item() 可以将tensor换成为 float, 并把数据放回CPU
+
+
+
+
+import sys; sys.exit(0)   # 代码走到这里就会停止, 这是一个debug的时候比较不错的方式
