@@ -495,19 +495,6 @@ if torch.cuda.is_available():
 elif torch.backends.mps.is_available():
     torch.mps.manual_seed(1337)
 
-# get a data batch 
-enc = tiktoken.get_encoding("gpt2")
-with open("dev/data/tinyshakespeare/tiny_shakespeare.txt", 'r') as f:
-    text = f.read()
-text = text[:1000]
-tokens = enc.encode(text)  # 1000个单词进行预处理后剩下 285 个token
-B,T, = 4, 32
-buf = torch.tensor(tokens[:B*T + 1])
-buf = buf.to(device)          # 先把buffer丢到GPU, 后续的x,y就不用再次操作了
-x = buf[:-1].view(B,T)  # (B,T)
-y = buf[1:].view(B,T)   # (B,T)
-
-# get logits
 model = GPT(GPTConfig)
 model.to(device)
 # model = torch.compile(model)  # pytorch 2.0 之后支持模型编译, 类似使用 GCC/G++ 之类的编译器编译代码, 而不是直接用python解释器去跑
@@ -544,25 +531,40 @@ def get_lr(step):
     return min_lr + coeff * (max_lr - min_lr)
 
 # train model
-train_loader = DataLoaderLite(B=4, T=32)  # batch size 尽可能使用2的倍数, 因为硬件都是2进制, 这样可以让机器运行效率高一些
+'''
+在 GPT-3 paper 的模型超参数表格中, 参数量约为125M的模型对应的 batch size 为 0.5M(这是每次丢进模型的token总数量), lr 为 6e-4
+    因为 batch size 与 lr, AdamW 的 betas 等超参数是存在关联性的, 因此, 如果我们其他地方已经是用了GPT-3的超参数, 那么每次丢进模型的token数量也应该尽可能达到相应的数量.
+        这个方法就是 按照GPU的显存, 设置一个最大的batch size, 但是先不更新参数, 而是将梯度累加, 当 feed 进模型的token数量达到我们想要的数值时才进行参数更新.
+'''
+total_batch_size = 524288 # 0.5M token 这个数不是2的倍数, 这里取 2^19=524288, 某种程度上或许可以让GPU的利用率高些
+B = 4   # micro batch
+T = 1024  # sequence length (注意GPT-2单次最长只支持1024个token)
+assert total_batch_size % (B*T) == 0, "Please make sure total_batch_size is divisible by B*T!"
+grad_accum_steps = total_batch_size // (B*T)   # 计算要走多少个 step 之后才更新参数
+print(f"total desired batch size: {total_batch_size}")
+print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+train_loader = DataLoaderLite(B=B, T=T)  # batch size 尽可能使用2的倍数, 因为硬件都是2进制, 这样可以让机器运行效率高一些
 
 # torch.set_float32_matmul_precision("high")  # hight: 做乘法的时候使用TF32(精度下降), highest: 做乘法的时候一直使用FP32
                                                 # 只在 A100之后 的N卡上有用, 在mac上无效
 
+loss_accum = 0.0
 for step in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
+
     optimizer.zero_grad()     # 一定以及 清空历史 梯度!!!
     
-    # --------- 使用混精度数据类型加速(只有 30系列之后 的 N卡 支持) ------------
-    # with torch.autocast(device_type=device, dtype=torch.bfloat16):  # mac不支持, 只有安培架构(30系列显卡)之后才支持
-    #     logits, loss = model(x, y)
-    logits, loss = model(x, y)   # 非混精度模式
-    
-    # import code; code.interact(local=locals())   # 通过这行代码, 我们可以在终端触发一个 interactive console, 直接进行一些debug操作
-    
-    loss.backward()    # 计算梯度
+    for micro_step in range(grad_accum_steps):    # 为了使丢进模型的 total batch token 能与 GPT-3 paper 里的超参数匹配, 这里需要使用 accumulate gradient 的技巧(也就是这个内层for循环)
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        # --------- 使用混精度数据类型加速(只有 30系列之后 的 N卡 支持) ------------
+        # with torch.autocast(device_type=device, dtype=torch.bfloat16):  # mac不支持, 只有安培架构(30系列显卡)之后才支持
+        #     logits, loss = model(x, y)
+        logits, loss = model(x, y)   # 非混精度模式
+        loss = loss / grad_accum_steps                # 由于这里直接进行了梯度累加, 而计算 loss 的时候, 函数内部是自动求了平均的, 因此这里需要额外除以 grad_accum_steps 进行修正 (本质上是一个乘法分配律) -- 在 当前文件夹下的 play.ipynb 中有代码示例
+        loss_accum += loss.detach()                   # 只是为了打印出来看一看
+        loss.backward()    # 计算梯度 (在当前这个嵌套的for循环里, 基于pytorch的特性, 梯度会自动进行累加)
     
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # GPT-3里提到的操作: 将 global norm of the gradient 给 clip 到 1.0
                                                                     # 这个函数做的操作: 将所有参数的梯度求平方和, 再开方 (求L2范数); 如果范数的值大于指定的数值, 就会缩放这些梯度来满足指定的范数大小条件; 返回的norm是裁剪之前的梯度范数值.
@@ -579,8 +581,9 @@ for step in range(max_steps):
     # torch.cuda.synchronize()   # wait for GPU to finish work (只在 N卡 上有用, mac上无效)
     
     t1 = time.time()
-    dt = (t1 - t0) * 1000 # time difference in miliseconds
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {step} | loss: {loss.item():.6f} | lr: {lr:.5f} | norm: {norm:.4f} | dt: {dt:2f}ms | tok/sec: {tokens_per_sec}")   # loss.item() 可以将tensor换成为 float, 并把数据放回CPU
+    dt = (t1 - t0)  # time difference in seconds
+    tokens_processed = train_loader.B & train_loader.T * grad_accum_steps
+    tokens_per_sec = tokens_processed / dt
+    print(f"step {step} | loss: {loss_accum.item():.6f} | lr: {lr:.5f} | norm: {norm:.4f} | dt: {dt:2f} s | tok/sec: {tokens_per_sec:.2f}")   # loss.item() 可以将tensor换成为 float, 并把数据放回CPU
 
 import sys; sys.exit(0)   # 代码走到这里就会停止, 这是一个debug的时候比较不错的方式
