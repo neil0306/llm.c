@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import math
+import inspect
 import torch
 import torch.nn as nn
 from torch.nn import functional as F 
@@ -148,6 +149,42 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)                     # pytorch 里, bias的默认初始化并不是0, 而是按照均匀分布进行初始化
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)   # 同上
+
+    def configure_optimizer(self, weight_decay, learning_rate, device):
+        """
+        GPT-3: "All models use weight decay of 0.1 to provide a small amount of regularization."
+        
+        1. 取出所有需要计算梯度的模型参数
+        2. 只对2D参数做 weight decay regularization, 因为1D的参数要么是scale factor, 要么是layernorm, 或者linear layer的bias, 这些参数不进行decay也OK的
+        """
+        
+        # start with all of the candidate parameters (that require grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}     # 获取模型参数
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}  # 筛选需要计算梯度的参数
+        
+        # create optim groups, any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay. all biases and layer norms don't.
+        decay_params = [p for n,p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": nodecay_params, "weight_decay": 0.0}
+        ]
+        
+        num_decay_params = sum(p.numel() for p in  decay_params)
+        num_nodecay_params = sum(p.numel() for p in  nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params} parameters")
+
+        # 早期版本的pytorch中, adamw内并没有 fused 操作(也就是 kernel fused), 所以这里进行一下检查
+        # create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters  # 检查pytorch是否支持 fused 加速 (带签名就是支持)
+        use_fused = fused_available and 'cuda' in device                              # 如果支持, 并且用的是 N卡, 则弄一个flag给AdamW
+        print(f"using fused Adamw: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+
+        return optimizer
+
 
     def forward(self, idx, targets=None):
         # idx is of shape (B, T), T is short for "Time" 
@@ -337,6 +374,110 @@ class DataLoaderLite:
 #     print("->", decode)
 
 # ---------------------------------- train our GPT-2  ---------------------------------------------------
+# device = "cpu"
+# if torch.cuda.is_available():
+#     device = "cuda"
+# elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+#     device = "mps"    # macbook
+# else:
+#     device = "cpu"
+
+# print(f"We are using {device} ...")
+
+# # 固定随机种子, 便于复现结果
+# torch.manual_seed(1337)
+# if torch.cuda.is_available():
+#     torch.cuda.manual_seed(1337)
+# elif torch.backends.mps.is_available():
+#     torch.mps.manual_seed(1337)
+
+# # get a data batch 
+# import tiktoken
+# enc = tiktoken.get_encoding("gpt2")
+# with open("dev/data/tinyshakespeare/tiny_shakespeare.txt", 'r') as f:
+#     text = f.read()
+# text = text[:1000]
+# tokens = enc.encode(text)  # 1000个单词进行预处理后剩下 285 个token
+# B,T, = 4, 32
+# buf = torch.tensor(tokens[:B*T + 1])
+# buf = buf.to(device)          # 先把buffer丢到GPU, 后续的x,y就不用再次操作了
+# x = buf[:-1].view(B,T)  # (B,T)
+# y = buf[1:].view(B,T)   # (B,T)
+
+# # get logits
+# model = GPT(GPTConfig)
+# model.to(device)
+# # model = torch.compile(model)  # pytorch 2.0 之后支持模型编译, 类似使用 GCC/G++ 之类的编译器编译代码, 而不是直接用python解释器去跑
+#                                 # mac上的pytorch目前不支持编译
+                                
+#                                 # torch.compile() 的功能主要是过一遍整个网络, 然后将一些操作进行整合, 比如 GELU 激活函数, 里面有一些求指数, 开方, 乘加操作, 
+#                                 # 由于这些操作都是对同一拨数据按顺序计算, compile的时候将它们直接整合(称为kernel fusion), 这样就可以避免多次数据的存取, 降低延迟, 
+#                                 # 因此 torch.compile 是加速模型的一种通用手段
+
+# # logits, loss = model(x, y)  # 输出的loss差不多是10.9930(或者11左右), 
+# #                             # 注意现在还没有开始训练, 输出这个数值是因为 cross-entropy 本质上就是计算 -ln(probability),
+# #                             # 由于我们词表大小是 20257, 如果初始化的模型等同于均匀分布, 那么我们预测的下一个词的概率就应该接近 1/20257, 此时得到 9.91625, 
+# #                             # 因此这里输出 10.9930 是可以接受的初始化状态
+# # print(loss)
+
+# # optimizer!!
+# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)   # adamw 可以当做是 adam 优化器修了一个bug;  
+#                                                              # 3e-4 是大家常用的 early age debug Learning Rate
+
+# # # debug stage: 用小批量数据(一直不加新数据进来), 反复更新梯度, 看看模型是否能过拟合, 如果会过拟合, 证明模型在正常训练
+# # for i in range(50):
+# #     optimizer.zero_grad()     # 一定以及 清空历史 梯度!!!
+# #     logits, loss = model(x, y)
+# #     loss.backward()    # 计算梯度
+# #     optimizer.step()   # 更新参数
+# #     print(f"step {i}, loss: {loss.item()}")   # loss.item() 可以将tensor换成为 float, 并把数据放回CPU
+
+
+# # train model
+# import time
+# train_loader = DataLoaderLite(B=4, T=32)  # batch size 尽可能使用2的倍数, 因为硬件都是2进制, 这样可以让机器运行效率高一些
+
+# # torch.set_float32_matmul_precision("high")  # hight: 做乘法的时候使用TF32(精度下降), highest: 做乘法的时候一直使用FP32
+#                                                 # 只在 A100之后 的N卡上有用, 在mac上无效
+
+# for i in range(50):
+#     t0 = time.time()
+#     x, y = train_loader.next_batch()
+#     x, y = x.to(device), y.to(device)
+#     optimizer.zero_grad()     # 一定以及 清空历史 梯度!!!
+    
+#     # --------- 使用混精度数据类型加速 ------------
+#     # with torch.autocast(device_type=device, dtype=torch.bfloat16):  # mac不支持, 只有安培架构(30系列显卡)之后才支持
+#     #     logits, loss = model(x, y)
+#     logits, loss = model(x, y)   # 非混精度模式
+    
+    
+#     # import code; code.interact(local=locals())   # 通过这行代码, 我们可以在终端触发一个 interactive console, 直接进行一些debug操作
+    
+#     loss.backward()    # 计算梯度
+    
+#     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # GPT-3里提到的操作: 将 global norm of the gradient 给 clip 到 1.0
+#                                                                     # 这个函数做的操作: 将所有参数的梯度求平方和, 再开方 (求L2范数); 如果范数的值大于指定的数值, 就会缩放这些梯度来满足指定的范数大小条件; 返回的norm是裁剪之前的梯度范数值.
+#                                                                     # 作用: 防止某些batch产生的loss很大, 导致梯度发生剧烈变化, 让训练不稳定
+#                                                                     # 通常我们会把这个函数返回的 norm 值打印出来, 如果这个norm一直都挺平稳的, 不会随着训练一直增大, 在一定程度上说明模型正在稳定训练
+    
+#     optimizer.step()   # 更新参数
+    
+#     # torch.cuda.synchronize()   # wait for GPU to finish work (只有在N卡上有用, mac上无效)
+    
+#     t1 = time.time()
+#     dt = (t1 - t0) * 1000 # time difference in miliseconds
+#     tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+#     print(f"step {i} | loss: {loss.item():.6f} | norm: {norm:.4f} | dt: {dt:2f}ms | tok/sec: {tokens_per_sec}")   # loss.item() 可以将tensor换成为 float, 并把数据放回CPU
+
+# import sys; sys.exit(0)   # 代码走到这里就会停止, 这是一个debug的时候比较不错的方式
+
+# --------------------------------------------------------------------------------------------------------------------------------------------
+
+# -------------------- train GPT-2 following GPT-3 paper's setup detail ----------------
+import time
+import tiktoken
+
 device = "cpu"
 if torch.cuda.is_available():
     device = "cuda"
@@ -355,7 +496,6 @@ elif torch.backends.mps.is_available():
     torch.mps.manual_seed(1337)
 
 # get a data batch 
-import tiktoken
 enc = tiktoken.get_encoding("gpt2")
 with open("dev/data/tinyshakespeare/tiny_shakespeare.txt", 'r') as f:
     text = f.read()
@@ -377,54 +517,70 @@ model.to(device)
                                 # 由于这些操作都是对同一拨数据按顺序计算, compile的时候将它们直接整合(称为kernel fusion), 这样就可以避免多次数据的存取, 降低延迟, 
                                 # 因此 torch.compile 是加速模型的一种通用手段
 
-# logits, loss = model(x, y)  # 输出的loss差不多是10.9930(或者11左右), 
-#                             # 注意现在还没有开始训练, 输出这个数值是因为 cross-entropy 本质上就是计算 -ln(probability),
-#                             # 由于我们词表大小是 20257, 如果初始化的模型等同于均匀分布, 那么我们预测的下一个词的概率就应该接近 1/20257, 此时得到 9.91625, 
-#                             # 因此这里输出 10.9930 是可以接受的初始化状态
-# print(loss)
-
 # optimizer!!
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)   # adamw 可以当做是 adam 优化器修了一个bug;  
-                                                             # 3e-4 是大家常用的 early age debug Learning Rate
+# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)   # adamw 可以当做是 adam 优化器修了一个bug;  
+                                                                # 3e-4 是大家常用的 early age debug Learning Rate
+optimizer = model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device=device)  # 这里的 weight_decay 由模型内的一个自定义方法来完成
 
-# # debug stage: 用小批量数据(一直不加新数据进来), 反复更新梯度, 看看模型是否能过拟合, 如果会过拟合, 证明模型在正常训练
-# for i in range(50):
-#     optimizer.zero_grad()     # 一定以及 清空历史 梯度!!!
-#     logits, loss = model(x, y)
-#     loss.backward()    # 计算梯度
-#     optimizer.step()   # 更新参数
-#     print(f"step {i}, loss: {loss.item()}")   # loss.item() 可以将tensor换成为 float, 并把数据放回CPU
+# ------- cosine decay implementation ----------
+max_lr = 6e-4           # GPT-3里的参数
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50          # 最大循环次数, 为了方便演示, 只设置50次
 
+def get_lr(step):
+    # 1) linear warmup for warmup_iters steps (按照 step 线性增涨)
+    if step < warmup_steps:
+        return max_lr * (step+1) / warmup_steps     # 加1是因为 lr 设置为0没啥意义
+    
+    # 2) if step > lr_decay_iters, return min learning rate
+    if step > max_steps:
+        return min_lr
+    
+    # 3) in between, use consine decay down to min learning rate
+    decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff start at 1.0 and goes to 0
+    return min_lr + coeff * (max_lr - min_lr)
 
 # train model
-import time
 train_loader = DataLoaderLite(B=4, T=32)  # batch size 尽可能使用2的倍数, 因为硬件都是2进制, 这样可以让机器运行效率高一些
 
 # torch.set_float32_matmul_precision("high")  # hight: 做乘法的时候使用TF32(精度下降), highest: 做乘法的时候一直使用FP32
                                                 # 只在 A100之后 的N卡上有用, 在mac上无效
 
-for i in range(50):
+for step in range(max_steps):
     t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()     # 一定以及 清空历史 梯度!!!
     
-    # --------- 使用混精度数据类型加速 ------------
+    # --------- 使用混精度数据类型加速(只有 30系列之后 的 N卡 支持) ------------
     # with torch.autocast(device_type=device, dtype=torch.bfloat16):  # mac不支持, 只有安培架构(30系列显卡)之后才支持
     #     logits, loss = model(x, y)
-    logits, loss = model(x, y)
-    
+    logits, loss = model(x, y)   # 非混精度模式
     
     # import code; code.interact(local=locals())   # 通过这行代码, 我们可以在终端触发一个 interactive console, 直接进行一些debug操作
     
     loss.backward()    # 计算梯度
+    
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # GPT-3里提到的操作: 将 global norm of the gradient 给 clip 到 1.0
+                                                                    # 这个函数做的操作: 将所有参数的梯度求平方和, 再开方 (求L2范数); 如果范数的值大于指定的数值, 就会缩放这些梯度来满足指定的范数大小条件; 返回的norm是裁剪之前的梯度范数值.
+                                                                    # 作用: 防止某些batch产生的loss很大, 导致梯度发生剧烈变化, 让训练不稳定
+                                                                    # 通常我们会把这个函数返回的 norm 值打印出来, 如果这个norm一直都挺平稳的, 不会随着训练一直增大, 在一定程度上说明模型正在稳定训练
+    
+    # 按照GPT-3文章的描述, lr 按照 consine decay 的方式进行衰减
+    lr = get_lr(step)                                               # 按照 cosine decay 的方式计算 当前的lr
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
+    
     optimizer.step()   # 更新参数
     
-    # torch.cuda.synchronize()   # wait for GPU to finish work (只有在N卡上有用, mac上无效)
+    # torch.cuda.synchronize()   # wait for GPU to finish work (只在 N卡 上有用, mac上无效)
     
     t1 = time.time()
     dt = (t1 - t0) * 1000 # time difference in miliseconds
     tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {i}, loss: {loss.item()}, dt: {dt:2f}ms, tok/sec: {tokens_per_sec}")   # loss.item() 可以将tensor换成为 float, 并把数据放回CPU
+    print(f"step {step} | loss: {loss.item():.6f} | lr: {lr:.5f} | norm: {norm:.4f} | dt: {dt:2f}ms | tok/sec: {tokens_per_sec}")   # loss.item() 可以将tensor换成为 float, 并把数据放回CPU
 
 import sys; sys.exit(0)   # 代码走到这里就会停止, 这是一个debug的时候比较不错的方式
