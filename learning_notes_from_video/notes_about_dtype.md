@@ -19,3 +19,35 @@ GPU的FLOPS通常指的是`乘,加运算`, 也就是做矩阵乘法的时候的�
     ![](notes_about_dtype_images/A100在TF32和FP32在计算时使用的精度截断.png)
   - A100 GPU 在矩阵乘法运算中, 虽然 Input 和 Output 使用的都是 FP32 的数据表示方法, 但是在进行`乘法`的时候将精度截断了10位, 使得精度降低但速度变快, 然后到累加器中, 使用仍然是FP32, 维持乘法输出的精度.
   - 图片来自[A100GPU架构白皮书](https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf)
+
+在使用 A100 GPU时, 我们只需要在代码中设置`torch.set_float32_matmul_precision("high")`, 就能让矩阵乘法加速, 不过同时也会带来精度上的损失.
+- 注意: 这只是在矩阵乘法的中间过程中短暂地使用了TF32类型, 在整个网络的任意位置查看参数`dtype`的时候仍然是 FP32 类型.
+```python
+# train model
+import time
+train_loader = DataLoaderLite(B=4, T=32)  # batch size 尽可能使用2的倍数, 因为硬件都是2进制, 这样可以让机器运行效率高一些
+
+torch.set_float32_matmul_precision("high")  # hight: 做乘法的时候使用TF32(精度下降), highest: 做乘法的时候仍然使用FP32
+                                                # 只在 A100之后 的N卡上有用, 在mac上无效
+
+for i in range(50):
+    t0 = time.time()
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad()     # 一定以及 清空历史 梯度!!!
+    logits, loss = model(x, y)
+    
+    # import code; code.interact(local=locals())   # 通过这行代码, 我们可以在终端触发一个 interactive console, 直接进行一些debug操作
+    
+    loss.backward()    # 计算梯度
+    optimizer.step()   # 更新参数
+    
+    # torch.cuda.synchronize()   # wait for GPU to finish work (只有在N卡上有用, mac上无效)
+    
+    t1 = time.time()
+    dt = (t1 - t0) * 1000 # time difference in miliseconds
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {i}, loss: {loss.item()}, dt: {dt:2f}ms, tok/sec: {tokens_per_sec}")   # loss.item() 可以将tensor换成为 float, 并把数据放回CPU
+
+import sys; sys.exit(0)   # 代码走到这里就会停止, 这是一个debug的时候比较不错的方式
+```
