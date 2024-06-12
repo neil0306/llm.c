@@ -366,6 +366,10 @@ model = GPT(GPTConfig)
 model.to(device)
 # model = torch.compile(model)  # pytorch 2.0 之后支持模型编译, 类似使用 GCC/G++ 之类的编译器编译代码, 而不是直接用python解释器去跑
                                 # mac上的pytorch目前不支持编译
+                                
+                                # torch.compile() 的功能主要是过一遍整个网络, 然后将一些操作进行整合, 比如 GELU 激活函数, 里面有一些求指数, 开方, 乘加操作, 
+                                # 由于这些操作都是对同一拨数据按顺序计算, compile的时候将它们直接整合(称为kernel fusion), 这样就可以避免多次数据的存取, 降低延迟, 
+                                # 因此 torch.compile 是加速模型的一种通用手段
 
 # logits, loss = model(x, y)  # 输出的loss差不多是10.9930(或者11左右), 
 #                             # 注意现在还没有开始训练, 输出这个数值是因为 cross-entropy 本质上就是计算 -ln(probability),
