@@ -364,6 +364,9 @@ y = buf[1:].view(B,T)   # (B,T)
 # get logits
 model = GPT(GPTConfig)
 model.to(device)
+# model = torch.compile(model)  # pytorch 2.0 之后支持模型编译, 类似使用 GCC/G++ 之类的编译器编译代码, 而不是直接用python解释器去跑
+                                # mac上的pytorch目前不支持编译
+
 # logits, loss = model(x, y)  # 输出的loss差不多是10.9930(或者11左右), 
 #                             # 注意现在还没有开始训练, 输出这个数值是因为 cross-entropy 本质上就是计算 -ln(probability),
 #                             # 由于我们词表大小是 20257, 如果初始化的模型等同于均匀分布, 那么我们预测的下一个词的概率就应该接近 1/20257, 此时得到 9.91625, 
@@ -384,15 +387,34 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)   # adamw 可以当�
 
 
 # train model
-train_loader = DataLoaderLite(B=4, T=32)
+import time
+train_loader = DataLoaderLite(B=4, T=32)  # batch size 尽可能使用2的倍数, 因为硬件都是2进制, 这样可以让机器运行效率高一些
+
+# torch.set_float32_matmul_precision("high")  # hight: 做乘法的时候使用TF32(精度下降), highest: 做乘法的时候一直使用FP32
+                                                # 只在 A100之后 的N卡上有用, 在mac上无效
 
 for i in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()     # 一定以及 清空历史 梯度!!!
+    
+    # --------- 使用混精度数据类型加速 ------------
+    # with torch.autocast(device_type=device, dtype=torch.bfloat16):  # mac不支持, 只有安培架构(30系列显卡)之后才支持
+    #     logits, loss = model(x, y)
     logits, loss = model(x, y)
+    
+    
+    # import code; code.interact(local=locals())   # 通过这行代码, 我们可以在终端触发一个 interactive console, 直接进行一些debug操作
+    
     loss.backward()    # 计算梯度
     optimizer.step()   # 更新参数
-    print(f"step {i}, loss: {loss.item()}")   # loss.item() 可以将tensor换成为 float, 并把数据放回CPU
+    
+    # torch.cuda.synchronize()   # wait for GPU to finish work (只有在N卡上有用, mac上无效)
+    
+    t1 = time.time()
+    dt = (t1 - t0) * 1000 # time difference in miliseconds
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {i}, loss: {loss.item()}, dt: {dt:2f}ms, tok/sec: {tokens_per_sec}")   # loss.item() 可以将tensor换成为 float, 并把数据放回CPU
 
 import sys; sys.exit(0)   # 代码走到这里就会停止, 这是一个debug的时候比较不错的方式
