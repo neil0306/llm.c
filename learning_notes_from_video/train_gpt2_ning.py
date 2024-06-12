@@ -36,11 +36,17 @@ class CausalSelfAttention(nn.Module):   # 因果(时序)attention: 掩盖掉 t �
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1,2)  # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1,2)  # (B, nh, T, hs)
 
+        # ------- original causal self-attention -------
         # attention (materializes the large (T,T) matrix for all the queries and keys)
-        att = (q @ k.transpose(-2, -1) * (1.0 / math.sqrt(k.size(-1))))   # attention 公式
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float("-inf"))   # masked, 只保留下三角阵的数值(按照时间顺序, q的每一行只比上一行多看到一个k的信息), 防止信息泄露
-        att = F.softmax(att, dim=-1)
-        y = att @ v    # (B,nh,T,T) x (B,nh,T,hs) => (B,nh,T,hs), weighted sum operation
+        # att = (q @ k.transpose(-2, -1) * (1.0 / math.sqrt(k.size(-1))))   # attention 公式
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float("-inf"))   # masked, 只保留下三角阵的数值(按照时间顺序, q的每一行只比上一行多看到一个k的信息), 防止信息泄露
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v    # (B,nh,T,T) x (B,nh,T,hs) => (B,nh,T,hs), weighted sum operation
+        
+        #  ------------- Flash Attention -----------------
+        # 由于 torch.compile 无法将 Attention 操作进行识别并整合(无法自动实行 kernel fusion), 故这里需要引入 Flash Attention
+        # 它整合了 matmul(矩阵乘法, q@k), Dropout, Softmax, mask 和 matmul(矩阵乘法, att@v), 这样就避免了将 (N,N) 大小的 Attention matrix 在 HBM 中反复读写造成的延迟 
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         # re-assemble all head outputs side by side, it is also a "Concatenation" operation
             # 通常: 在使用了 transpose, split(切片), view, narrow 这些操作之后, 需要重新整理数组元素, 否则可能发生意外错误(比如某些索引操作除错, 而且会导致性能下降)  
