@@ -271,27 +271,66 @@ class GPT(nn.Module):
         return model
 
 
-# ----------------------------- Define our DataLoader -------------------------------------------------------------------------------
+# ----------------------------- Stage-5: Define our DataLoader (with DDP setting options) -------------------------------------------------------------------------------
 import tiktoken
+import numpy as np
+
+def load_tokens(filename):
+    """
+    由于作者的最终目的是用C语言跑模型, 故他将下载的数据写入了一个.bin 文件中, 因此, 要注意读取数据无法直接用 numpy 来读.
+    """
+    with open(filename, "rb") as f:
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)                        # 前4个字节是作者在写入bin文件的时候塞进去的校验信息, np.frombuffer 将读取的东西转成 numpy 数组
+        assert header[0] == 20240520, "magic number mismatch in the data .bin file"  # 这个数是写bin文件的时候自定义的
+        assert header[1] == 1, "unsupported version"                                 # 也是写bin文件的时候自定义的
+        ntok = header[2] # number of tokens (claimed)                                # 写bin文件的时候对文件内的token总数进行了记录, 这里读回来
+        # the rest of it are tokens, stored as uint16
+        buf = np.frombuffer(f.read(), dtype=np.uint16)                               # 读取所有token
+    assert len(buf) == ntok, "number of tokens read does not match header?"
+    
+    tokens = torch.tensor(buf.astype(np.int32), dtype=torch.long)                    # bin文件中的token都是 uint16 类型(省空间), 这里进行类型转换
+    return tokens
+
 class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes):
+    def __init__(self, B, T, process_rank, num_processes, split):
         self.B = B
         self.T = T
         self.process_rank = process_rank    # ddp 参数
         self.num_processes = num_processes  # ddp 参数
+        assert split in {"train", "val"}
 
-        with open("dev/data/tinyshakespeare/tiny_shakespeare.txt", 'r') as f:
-            text = f.read()
-        enc = tiktoken.get_encoding("gpt2")
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
-
-        if master_process:
-            print(f"Loaded {len(tokens)} tokens.")
-            print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
+        # ---- In pre-version (Stage 1~4), we use tinyshakespeare dataset, but now we want to use the splited fineweb10B dataset --
+        # with open("dev/data/tinyshakespeare/tiny_shakespeare.txt", 'r') as f:
+        #     text = f.read()
+        # enc = tiktoken.get_encoding("gpt2")
+        # tokens = enc.encode(text)
+        # self.tokens = torch.tensor(tokens)
+        # if master_process:
+        #     print(f"Loaded {len(tokens)} tokens.")
+        #     print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
+        # self.current_position = self.B * self.T * self.process_rank  # 从原来的0, 改成通过 GPU 编号计算state
+        # -------------------------------------------------------------------------------------------------------------
         
-        # state
-        self.current_position = self.B * self.T * self.process_rank  # 从原来的0, 改成通过 GPU 编号计算state
+        # get the shard filenames
+        data_root = "dev/data/fineweb10B"
+        shards = os.listdir(data_root)               # 遍历文件夹, 获取文件名
+        shards = [s for s in shards if split in s]   # split用来标识 train 或 val
+        shards = sorted(shards)                      # 按文件名从小到大排序
+        shards = [os.path.join(data_root, s) for s in shards]  # 完整的文件路径(相对路径)
+        self.shards = shards
+        assert len(shards) > 0, f"no shards found for split {split}"
+        if master_process:
+            print(f"found {len(shards)} shards for split {split}")
+        
+        # 初始化数据读取的状态
+        self.reset()
+
+    def reset(self):
+        # state, init at shard zero
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -301,12 +340,22 @@ class DataLoaderLite:
         
         # advance the position in the tensor
         self.current_position += B*T * self.num_processes            # 改成ddp配置: 从原来的 B*T 改成 "B*T * self.num_processes", 通过GPU总数计算出下一次整体读取的起始位置
+        
+        # ----- stage 1~4: the code of using tinyshakespeare dataset  ------------
         # if loading the next batch would be out of bounds, reset
-        if self.current_position + (B*T * self.num_processes +1) > len(self.tokens):   # 改成ddp配置
-            self.current_position = 0
+        # if self.current_position + (B*T * self.num_processes +1) > len(self.tokens):   # 改成ddp配置
+        #     self.current_position = 0
+        # ------------------------------------------------------------------------
+        
+        # ----- stage 5: the code if using fineweb10B dataset ----------
+        # if loading the next batch would be out of bound, advance to next shard
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):  # "self.current_position + (B * T * self.num_processes + 1)" 表示下一次读取数据的起始位置
+            self.current_shard = (self.current_shard + 1) % len(self.shards)             # 取模, 可以确保shard的数值不会超过数据集中shard的总数, 并且只要超过, 就会从第一个shard开始重新读取数据
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = B * T * self.process_rank                            # 计算当前GPU应该读shard里的哪一段数据
         return x,y
 
-# ----------------------------- test of our GPT-2 (with/without loading pre-trained weights) -----------------------------------------
+# ----------------------------- Stage-1: test of our GPT-2 (with/without loading pre-trained weights) -----------------------------------------
 # device = "cpu"
 # # ning: 用2080Ti做实验, 指定一下GPU
 # # device = torch.device("cuda:2")   # 用2080Ti做实验
@@ -377,7 +426,7 @@ class DataLoaderLite:
 #     decode = enc.decode(tokens)
 #     print("->", decode)
 
-# ---------------------------------- train our GPT-2  ---------------------------------------------------
+# ---------------------------------- Stage-2: train our GPT-2  ---------------------------------------------------
 # device = "cpu"
 # if torch.cuda.is_available():
 #     device = "cuda"
@@ -478,7 +527,7 @@ class DataLoaderLite:
 
 # --------------------------------------------------------------------------------------------------------------------------------------------
 
-# # -------------------- train GPT-2 following GPT-3 paper's setup detail ----------------
+# # -------------------- Stage-3: train GPT-2 following GPT-3 paper's setup detail ----------------
 # import time
 # import tiktoken
 
@@ -593,19 +642,198 @@ class DataLoaderLite:
 # import sys; sys.exit(0)   # 代码走到这里就会停止, 这是一个debug的时候比较不错的方式
 
 
-# -------------------------- train GPT-2, PPD 版本 -------------------------------
+# -------------------------- Stage-4: train GPT-2, PPD 版本 -------------------------------
+# import time
+# import tiktoken
+
+# device = "cpu"
+# if torch.cuda.is_available():
+#     device = "cuda"
+# elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+#     device = "mps"    # macbook
+# else:
+#     device = "cpu"
+
+
+# import torch.distributed as dist   # DDP 操作的核心模块, 里面包含各种 ddp function
+# from torch.distributed import init_process_group, destroy_process_group
+# from torch.nn.parallel import DistributedDataParallel as DDP   # DDP 模块
+
+# # set up DDP (distributed data parallel).
+# # torchrun sets this env variable
+# ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?  (对于 torchrun 的启动方式来说, 这并不算一种好的检测方式) 
+#                                             # 这里指定nccl作为后端，nccl是NVIDIA开发的专门用于GPU集群通信的库，能够优化GPU间的通信效率。
+# if ddp:
+#     # use of DDP atm demands CUDA, we set the device appropriately according to rank
+#     assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+#     init_process_group(backend='nccl')
+#     ddp_rank = int(os.environ['RANK'])              # ddp_rank 通常表示当前进程在所有分布式进程中的编号, 如果是单机8卡环境, ddp_rank 数值范围就是 0~7
+#     ddp_local_rank = int(os.environ['LOCAL_RANK'])  # LOCAL_RANK 表示获取当机器的上局部标识, 也就是当前机器上的GPU ID(rank of the GPU on a single node)
+#     ddp_world_size = int(os.environ['WORLD_SIZE'])  # world_size 表示所有分布式节点包含的进程数(number of processes), 由于一个GPU对应一个进程, 这个也可以理解为GPU总数
+#     device = f'cuda:{ddp_local_rank}'
+#     torch.cuda.set_device(device)
+#     master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.   (可以理解为主进程, 表示这个进程需要 兼顾 记录log, 记录checkpoint之类的工作)
+# else:
+#     # vanilla, non-DDP
+#     ddp_rank = 0         # 全局进程ID, 这表示在整个分布式计算环境中, 当前运行的进程ID为0 (因为是单机单卡, 进程就一个, 编号为0)
+#     ddp_local_rank = 0   # 使用机器上编号为0的GPU
+#     ddp_world_size = 1   # 单机单卡
+#     master_process = True # 表示当前进程为主进程
+
+#     # attempt to autodetect the device
+#     device = "cpu"
+#     if torch.cuda.is_available():
+#         device = "cuda"
+#     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+#             device = "mps"
+#     print(f"using device: {device}")
+
+# # 固定随机种子, 便于复现结果
+# # 对于 ddp 配置, 这个种子**尤其重要**, 因为我们需要确保每个GPU的模型都能初始化成一样的状态!!
+# torch.manual_seed(1337)
+# if torch.cuda.is_available():
+#     torch.cuda.manual_seed(1337)
+# elif torch.backends.mps.is_available():
+#     torch.mps.manual_seed(1337)
+
+# model = GPT(GPTConfig)
+# model.to(device)
+# # model = torch.compile(model)  # pytorch 2.0 之后支持模型编译, 类似使用 GCC/G++ 之类的编译器编译代码, 而不是直接用python解释器去跑
+#                                 # mac上的pytorch目前不支持编译
+                                
+#                                 # torch.compile() 的功能主要是过一遍整个网络, 然后将一些操作进行整合, 比如 GELU 激活函数, 里面有一些求指数, 开方, 乘加操作, 
+#                                 # 由于这些操作都是对同一拨数据按顺序计算, compile的时候将它们直接整合(称为kernel fusion), 这样就可以避免多次数据的存取, 降低延迟, 
+#                                 # 因此 torch.compile 是加速模型的一种通用手段
+#                                 # 如果是DDP模式,这个 compile 操作会被触发多次, 有n个GPU就会并行地执行n次编译, 这是在CPU上通过ddp开启的线程完成的
+
+# # ddp模式需要用一个container将模型装起来
+# if ddp:
+#     model = DDP(model, device_ids=[ddp_local_rank])   # 注意, 传进去的时 ddp_local_rank, 即当前机器上的GPU编号
+#                                                         # DDP做的事情是: 当每一个GPU都完成了 forward, 用backward计算了模型梯度之后, DDP会执行一个称为 "all reduce" 的操作
+#                                                         #             1. 如果当前GPU已经走完 backward, 它就会马上将自己所有参数的梯度经过 NCCL 这个通信后端传给其他GPU, 并开始等待, 等其他GPU传梯度过来
+#                                                         #             2. GPU在接收到其他GPU传来梯度时会进行梯度累加, 然后将累加的结果除以GPU总数(我猜是先除GPU数,再累加,这样更快一些), 得到全局平均梯度, 这就完成了 all-reduce 操作
+
+# raw_model = model.module if ddp else model            # 由于model可能已经装到 DDP container 中, 防止后面优化器读取参数除错, 这里需要获取一下没放进container之前的model
+
+# # ------------ optimizer!! ---------------------
+# # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)   # adamw 可以当做是 adam 优化器修了一个bug;  
+#                                                                 # 3e-4 是大家常用的 early age debug Learning Rate
+# # optimizer = model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device=device)  # 这里的 weight_decay 由模型内的一个自定义方法来完成
+# optimizer = raw_model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device=device)  # 注意: optimizer 拿参数的时候需要从原模型中获取, 而不是从装进DDP container之后的模型中获取!
+
+# # ------- cosine decay implementation ----------
+# max_lr = 6e-4           # GPT-3里的参数
+# min_lr = max_lr * 0.1
+# warmup_steps = 10
+# max_steps = 50          # 最大循环次数, 为了方便演示, 只设置50次
+
+# def get_lr(step):
+#     # 1) linear warmup for warmup_iters steps (按照 step 线性增涨)
+#     if step < warmup_steps:
+#         return max_lr * (step+1) / warmup_steps     # 加1是因为 lr 设置为0没啥意义
+    
+#     # 2) if step > lr_decay_iters, return min learning rate
+#     if step > max_steps:
+#         return min_lr
+    
+#     # 3) in between, use consine decay down to min learning rate
+#     decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
+#     assert 0 <= decay_ratio <= 1
+#     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff start at 1.0 and goes to 0
+#     return min_lr + coeff * (max_lr - min_lr)
+
+# # train model
+# '''
+# 在 GPT-3 paper 的模型超参数表格中, 参数量约为125M的模型对应的 batch size 为 0.5M(这是每次丢进模型的token总数量), lr 为 6e-4
+#     因为 batch size 与 lr, AdamW 的 betas 等超参数是存在关联性的, 因此, 如果我们其他地方已经是用了GPT-3的超参数, 那么每次丢进模型的token数量也应该尽可能达到相应的数量.
+#         这个方法就是 按照GPU的显存, 设置一个最大的batch size, 但是先不更新参数, 而是将梯度累加, 当 feed 进模型的token数量达到我们想要的数值时才进行参数更新.
+# '''
+# total_batch_size = 524288 # 0.5M token 这个数不是2的倍数, 这里取 2^19=524288, 某种程度上或许可以让GPU的利用率高些
+# B = 4   # micro batch
+# T = 1024  # sequence length (注意GPT-2单次最长只支持1024个token)
+# assert total_batch_size % (B*T * ddp_world_size) == 0, "Please make sure total_batch_size is divisible by B*T*ddp_world_size!"
+# grad_accum_steps = total_batch_size // (B*T * ddp_world_size)   # 计算要走多少个 step 之后才更新参数, 在DDP环境中, 它是将多卡的梯度全部归集到一张卡(累计起来), 然后再统一更新参数的,
+#                                                                 # 因此, 要维持原来的 total_batch_size 的话, ddp环境下, 每张卡上跑的step就应该少一些.
+
+# if master_process:    # 我们不希望所有进程都打印一次, 因此只让主线程打印即可
+#     print(f"total desired batch size: {total_batch_size}")
+#     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+# # ------- 下面这几行命令是用来测试DDP是否正常工作的 ---------
+# # print("I am GPU", ddp_rank)
+# # print("Bye!")
+# # import sys; sys.exit(0)
+
+# # 在shell中, 我们不再是直接用 python + .py 文件的方式运行, 而是在终端中使用 torchrun:
+# # torchrun --standalone --nproc_per_node=2 train_gpt2_ning.py
+# #       standalone 表示单机; nproc_per_node 表示每个机器上启动多少个进程(通常每个GPU对应一个进程)
+# # -----------------------------------------------------
+
+
+# # 为了确保多卡环境下, 每张GPU加载到不同的数据, 这里的需要改一下我们自己写的 Dataloader
+# # train_loader = DataLoaderLite(B=B, T=T)  # batch size 尽可能使用2的倍数, 因为硬件都是2进制, 这样可以让机器运行效率高一些
+# train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)                # stage 1~4: 使用 tinyShakespeare dataset
+
+# # torch.set_float32_matmul_precision("high")  # hight: 做乘法的时候使用TF32(精度下降), highest: 做乘法的时候一直使用FP32
+#                                                 # 只在 A100之后 的N卡上有用, 在mac上无效
+
+# for step in range(max_steps):
+#     t0 = time.time()
+
+#     optimizer.zero_grad()     # 一定以及 清空历史 梯度!!!
+#     loss_accum = 0.0
+    
+#     for micro_step in range(grad_accum_steps):    # 为了使丢进模型的 total batch token 能与 GPT-3 paper 里的超参数匹配, 这里需要使用 accumulate gradient 的技巧(也就是这个内层for循环)
+#         x, y = train_loader.next_batch()
+#         x, y = x.to(device), y.to(device)
+#         # --------- 使用混精度数据类型加速(只有 30系列之后 的 N卡 支持) ------------
+#         # with torch.autocast(device_type=device, dtype=torch.bfloat16):  # mac不支持, 只有安培架构(A100之后的显卡)之后才支持
+#         #     logits, loss = model(x, y)
+#         logits, loss = model(x, y)   # 非混精度模式
+#         loss = loss / grad_accum_steps                # 由于这里直接进行了梯度累加, 而计算 loss 的时候, 函数内部是自动求了平均的, 因此这里需要额外除以 grad_accum_steps 进行修正 (本质上是一个乘法分配律) -- 在 当前文件夹下的 play.ipynb 中有代码示例
+#         loss_accum += loss.detach()                   # 只是为了打印出来看一看
+#         if ddp:
+#             model.require_backward_grad_sync = (micro_step == grad_accum_steps -1)    # 因为我们这里在进行梯度累加, 我们并不希望在还没累加完之前就同步梯度, 因此这里用 "require_backward_grad_sync" 控制是否同步
+#         loss.backward()    # 计算梯度 (在当前这个嵌套的for循环里, 基于pytorch的特性, 梯度会自动进行累加)
+    
+#     if ddp:
+#         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)   # 由于 model 丢到了 DDP container中, 因此梯度求了平均; 但 loss的累加并不在 container里, 它不会自动同步所有GPU上的loss
+#                                                             # 我们希望打印所有 GPU 上的平均loss, 所以这里手动加一个 all_reduce 操作, 注意求平均可以用 dist.RecudeOp.AVG 来完成
+
+#     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # GPT-3里提到的操作: 将 global norm of the gradient 给 clip 到 1.0
+#                                                                     # 这个函数做的操作: 将所有参数的梯度求平方和, 再开方 (求L2范数); 如果范数的值大于指定的数值, 就会缩放这些梯度来满足指定的范数大小条件; 返回的norm是裁剪之前的梯度范数值.
+#                                                                     # 作用: 防止某些batch产生的loss很大, 导致梯度发生剧烈变化, 让训练不稳定
+#                                                                     # 通常我们会把这个函数返回的 norm 值打印出来, 如果这个norm一直都挺平稳的, 不会随着训练一直增大, 在一定程度上说明模型正在稳定训练
+    
+#     # 按照GPT-3文章的描述, lr 按照 consine decay 的方式进行衰减
+#     lr = get_lr(step)                                               # 按照 cosine decay 的方式计算 当前的lr
+#     for param_group in optimizer.param_groups:
+#         param_group["lr"] = lr
+    
+#     optimizer.step()   # 更新参数
+    
+#     # torch.cuda.synchronize()   # wait for GPU to finish work (只在 N卡 上有用, mac上无效)
+    
+#     t1 = time.time()
+#     dt = (t1 - t0)  # time difference in seconds
+#     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size   # ddp
+#     tokens_per_sec = tokens_processed / dt
+#     if master_process:   # 只在 master 进程中打印
+#         print(f"step {step} | loss: {loss_accum.item():.6f} | lr: {lr:.5f} | norm: {norm:.4f} | dt: {dt:2f} s | tok/sec: {tokens_per_sec:.2f}")   # loss.item() 可以将tensor换成为 float, 并把数据放回CPU
+
+# if ddp:
+#     destroy_process_group()     # 优雅停止ddp进程
+
+# import sys; sys.exit(0)   # 代码走到这里就会停止, 这是一个debug的时候比较不错的方式
+
+# -------------------------------------------------------------------------------------------------------
+
+
+
+
+# ---------------------- stage 5: train GPT-2, DDP 版本, 使用 FineWeb10B 数据集 -----------------------
 import time
 import tiktoken
-
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"    # macbook
-else:
-    device = "cpu"
-
-
 import torch.distributed as dist   # DDP 操作的核心模块, 里面包含各种 ddp function
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP   # DDP 模块
@@ -649,7 +877,8 @@ elif torch.backends.mps.is_available():
 
 model = GPT(GPTConfig)
 model.to(device)
-# model = torch.compile(model)  # pytorch 2.0 之后支持模型编译, 类似使用 GCC/G++ 之类的编译器编译代码, 而不是直接用python解释器去跑
+print("Compiling model, please wait....")
+model = torch.compile(model)  # pytorch 2.0 之后支持模型编译, 类似使用 GCC/G++ 之类的编译器编译代码, 而不是直接用python解释器去跑
                                 # mac上的pytorch目前不支持编译
                                 
                                 # torch.compile() 的功能主要是过一遍整个网络, 然后将一些操作进行整合, 比如 GELU 激活函数, 里面有一些求指数, 开方, 乘加操作, 
@@ -667,16 +896,14 @@ if ddp:
 raw_model = model.module if ddp else model            # 由于model可能已经装到 DDP container 中, 防止后面优化器读取参数除错, 这里需要获取一下没放进container之前的model
 
 # ------------ optimizer!! ---------------------
-# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)   # adamw 可以当做是 adam 优化器修了一个bug;  
-                                                                # 3e-4 是大家常用的 early age debug Learning Rate
-# optimizer = model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device=device)  # 这里的 weight_decay 由模型内的一个自定义方法来完成
 optimizer = raw_model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device=device)  # 注意: optimizer 拿参数的时候需要从原模型中获取, 而不是从装进DDP container之后的模型中获取!
 
 # ------- cosine decay implementation ----------
 max_lr = 6e-4           # GPT-3里的参数
 min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50          # 最大循环次数, 为了方便演示, 只设置50次
+# stage 5: 使用 FineWeb10B dataset
+warmup_steps = 715        # 数值由来: GPT-3 paper 里提到 warmup 一共用了 375M token, batch size token数量为 0.5M, 我们取最接近的2的倍数, 即2^19; 于是 375e6 / 2**19 ≈ 715 steps
+max_steps = 19073         # 数值由来: 数据集一共10B tokens, 也就是 10e9, 按照GPT-3里的 batch size token数量(0.5M), 我们取最接近的2的倍数, 即2^19; 而 10e9 / (2**19) ≈ 19073 steps
 
 def get_lr(step):
     # 1) linear warmup for warmup_iters steps (按照 step 线性增涨)
@@ -710,69 +937,74 @@ if master_process:    # 我们不希望所有进程都打印一次, 因此只让
     print(f"total desired batch size: {total_batch_size}")
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-# ------- 下面这几行命令是用来测试DDP是否正常工作的 ---------
-# print("I am GPU", ddp_rank)
-# print("Bye!")
-# import sys; sys.exit(0)
+# 为了确保多卡环境下, 每张GPU加载到不同的数据, 这里的需要改一下我们自己写的 Dataloader, 为了支持 train/val split, 这里还改了读取数据的方式
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")   # stage 5: 使用 FineWeb10B dataset
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")       # stage 5: 使用 FineWeb10B dataset
 
-# 在shell中, 我们不再是直接用 python + .py 文件的方式运行, 而是在终端中使用 torchrun:
-# torchrun --standalone --nproc_per_node=2 train_gpt2_ning.py
-#       standalone 表示单机; nproc_per_node 表示每个机器上启动多少个进程(通常每个GPU对应一个进程)
-# -----------------------------------------------------
-
-
-# 为了确保多卡环境下, 每张GPU加载到不同的数据, 这里的需要改一下我们自己写的 Dataloader
-# train_loader = DataLoaderLite(B=B, T=T)  # batch size 尽可能使用2的倍数, 因为硬件都是2进制, 这样可以让机器运行效率高一些
-train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
-
-# torch.set_float32_matmul_precision("high")  # hight: 做乘法的时候使用TF32(精度下降), highest: 做乘法的时候一直使用FP32
-                                                # 只在 A100之后 的N卡上有用, 在mac上无效
+# 下面这个功能只在 A100之后 的N卡上有用, 在mac上无效
+torch.set_float32_matmul_precision("high")  # hight: 做乘法的时候使用TF32(精度下降), highest: 做乘法的时候一直使用FP32
 
 for step in range(max_steps):
     t0 = time.time()
 
-    optimizer.zero_grad()     # 一定以及 清空历史 梯度!!!
+    # validation loop: once in a while evaluate our validation loss
+    if step % 100 == 0:
+        model.eval()
+        val_loader.reset()              # 初始化数据读取状态: 读取第一个 val set 的 shard 0
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20         # evaluation 跑20个step
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                # # 混精度推理 (A100之后的GPU才支持, 3090 不支持)
+                # with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                #     logits, loss = model(x, y)
+                logits, loss = model(x, y)
+                loss /= val_loss_steps
+                val_loss_accum += loss.detach()   # 一定不要忘记 detach !!!!
+        if ddp:
+            dist.all_reduce(val_loss_accum, dist.ReduceOp.AVG)    # 将多卡的累计loss数值同步, 并求平均
+        if master_process:
+            print(f"validation loss: {val_loss_accum.item():4f}") # 限定只有主线程打印log
+
+    # train loop
+    model.train()
+    model.zero_grad()
     loss_accum = 0.0
-    
-    for micro_step in range(grad_accum_steps):    # 为了使丢进模型的 total batch token 能与 GPT-3 paper 里的超参数匹配, 这里需要使用 accumulate gradient 的技巧(也就是这个内层for循环)
+    # 内层循环: 梯度累加, 以达到GPT-3文章中的batch token数量
+    for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
-        # --------- 使用混精度数据类型加速(只有 30系列之后 的 N卡 支持) ------------
-        # with torch.autocast(device_type=device, dtype=torch.bfloat16):  # mac不支持, 只有安培架构(A100之后的显卡)之后才支持
+        # # 混精度推理 (A100之后的GPU才支持, 3090 不支持)
+        # with torch.autocast(device_type=device, dtype=torch.bfloat16):
         #     logits, loss = model(x, y)
-        logits, loss = model(x, y)   # 非混精度模式
-        loss = loss / grad_accum_steps                # 由于这里直接进行了梯度累加, 而计算 loss 的时候, 函数内部是自动求了平均的, 因此这里需要额外除以 grad_accum_steps 进行修正 (本质上是一个乘法分配律) -- 在 当前文件夹下的 play.ipynb 中有代码示例
-        loss_accum += loss.detach()                   # 只是为了打印出来看一看
+        logits, loss = model(x, y)
+        loss /= grad_accum_steps
+        loss_accum += loss.detach()
         if ddp:
-            model.require_backward_grad_sync = (micro_step == grad_accum_steps -1)    # 因为我们这里在进行梯度累加, 我们并不希望在还没累加完之前就同步梯度, 因此这里用 "require_backward_grad_sync" 控制是否同步
-        loss.backward()    # 计算梯度 (在当前这个嵌套的for循环里, 基于pytorch的特性, 梯度会自动进行累加)
-    
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps -1)  # 标记当前循环是否在 backward 时触发 all_reduce
+        loss.backward()           # 梯度累加 & 检查标志自动触发 all_reduce
     if ddp:
-        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)   # 由于 model 丢到了 DDP container中, 因此梯度求了平均; 但 loss的累加并不在 container里, 它不会自动同步所有GPU上的loss
-                                                            # 我们希望打印所有 GPU 上的平均loss, 所以这里手动加一个 all_reduce 操作, 注意求平均可以用 dist.RecudeOp.AVG 来完成
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)   # 梯度裁剪, 让模型训练更稳定
 
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # GPT-3里提到的操作: 将 global norm of the gradient 给 clip 到 1.0
-                                                                    # 这个函数做的操作: 将所有参数的梯度求平方和, 再开方 (求L2范数); 如果范数的值大于指定的数值, 就会缩放这些梯度来满足指定的范数大小条件; 返回的norm是裁剪之前的梯度范数值.
-                                                                    # 作用: 防止某些batch产生的loss很大, 导致梯度发生剧烈变化, 让训练不稳定
-                                                                    # 通常我们会把这个函数返回的 norm 值打印出来, 如果这个norm一直都挺平稳的, 不会随着训练一直增大, 在一定程度上说明模型正在稳定训练
-    
-    # 按照GPT-3文章的描述, lr 按照 consine decay 的方式进行衰减
-    lr = get_lr(step)                                               # 按照 cosine decay 的方式计算 当前的lr
-    for param_group in optimizer.param_groups:
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:   # 为每一组参数(这里的分组是指 "参数有无weight decay") 分别设置 Learning rate
         param_group["lr"] = lr
-    
-    optimizer.step()   # 更新参数
-    
-    # torch.cuda.synchronize()   # wait for GPU to finish work (只在 N卡 上有用, mac上无效)
-    
+
+    optimizer.step()                # 到这里, 梯度已经是全局平均梯度, lr 也已经设置完成, 开始更新权重参数 
+    torch.cuda.synchronize()        # DDP环境下, 等待所有GPU完成参数更新再进行后续操作
     t1 = time.time()
-    dt = (t1 - t0)  # time difference in seconds
-    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size   # ddp
+    dt = t1 - t0                    # 单位毫秒
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / dt
-    if master_process:   # 只在 master 进程中打印
-        print(f"step {step} | loss: {loss_accum.item():.6f} | lr: {lr:.5f} | norm: {norm:.4f} | dt: {dt:2f} s | tok/sec: {tokens_per_sec:.2f}")   # loss.item() 可以将tensor换成为 float, 并把数据放回CPU
+    if master_process:              # 只在 master 进程中打印
+        print(f"step {step} | loss: {loss_accum.item():.6f} | lr: {lr:.5f} | norm: {norm:.4f} | dt: {dt:2f} s | tok/sec: {tokens_per_sec:.2f}") 
 
 if ddp:
-    destroy_process_group()     # 优雅停止ddp进程
+    destroy_process_group()
 
 import sys; sys.exit(0)   # 代码走到这里就会停止, 这是一个debug的时候比较不错的方式
+
+
