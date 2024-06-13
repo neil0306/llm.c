@@ -286,8 +286,9 @@ class DataLoaderLite:
         tokens = enc.encode(text)
         self.tokens = torch.tensor(tokens)
 
-        print(f"Loaded {len(tokens)} tokens.")
-        print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
+        if master_process:
+            print(f"Loaded {len(tokens)} tokens.")
+            print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
         
         # state
         self.current_position = self.B * self.T * self.process_rank  # 从原来的0, 改成通过 GPU 编号计算state
@@ -715,7 +716,7 @@ if master_process:    # 我们不希望所有进程都打印一次, 因此只让
 # import sys; sys.exit(0)
 
 # 在shell中, 我们不再是直接用 python + .py 文件的方式运行, 而是在终端中使用 torchrun:
-# torchrun --standalone --nproc_per_node=8 train_gpt2_ning.py
+# torchrun --standalone --nproc_per_node=2 train_gpt2_ning.py
 #       standalone 表示单机; nproc_per_node 表示每个机器上启动多少个进程(通常每个GPU对应一个进程)
 # -----------------------------------------------------
 
@@ -727,17 +728,17 @@ train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp
 # torch.set_float32_matmul_precision("high")  # hight: 做乘法的时候使用TF32(精度下降), highest: 做乘法的时候一直使用FP32
                                                 # 只在 A100之后 的N卡上有用, 在mac上无效
 
-loss_accum = 0.0
 for step in range(max_steps):
     t0 = time.time()
 
     optimizer.zero_grad()     # 一定以及 清空历史 梯度!!!
+    loss_accum = 0.0
     
     for micro_step in range(grad_accum_steps):    # 为了使丢进模型的 total batch token 能与 GPT-3 paper 里的超参数匹配, 这里需要使用 accumulate gradient 的技巧(也就是这个内层for循环)
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
         # --------- 使用混精度数据类型加速(只有 30系列之后 的 N卡 支持) ------------
-        # with torch.autocast(device_type=device, dtype=torch.bfloat16):  # mac不支持, 只有安培架构(30系列显卡)之后才支持
+        # with torch.autocast(device_type=device, dtype=torch.bfloat16):  # mac不支持, 只有安培架构(A100之后的显卡)之后才支持
         #     logits, loss = model(x, y)
         logits, loss = model(x, y)   # 非混精度模式
         loss = loss / grad_accum_steps                # 由于这里直接进行了梯度累加, 而计算 loss 的时候, 函数内部是自动求了平均的, 因此这里需要额外除以 grad_accum_steps 进行修正 (本质上是一个乘法分配律) -- 在 当前文件夹下的 play.ipynb 中有代码示例
